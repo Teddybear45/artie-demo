@@ -67,11 +67,44 @@ Alternatives considered:
 
 - **Snapshot-per-change** (rewrite full state + atomic rename): less code but
   O(n) disk work per operation — collapses under load as the queue grows.
-- **WAL + periodic snapshots** (the Redis RDB+AOF hybrid): bounds log size and
-  restart time, but roughly doubles the persistence code. This is the natural
-  next step here, along with **compaction** (rewrite the log keeping only live
-  messages) — both deliberately described rather than built.
+- **WAL + periodic snapshots**: the production-grade hybrid — designed below,
+  deliberately not built.
 - **Embedded SQLite/bbolt**: ruled out as delegating storage to a database.
+
+### Periodic snapshots — the designed-but-not-built half of the hybrid
+
+The WAL alone has two costs that grow with *history* rather than with *live
+data*: the log file never shrinks, and restart replay touches every operation
+ever performed — including the millions of messages that were long since
+consumed. Periodic snapshots (the same idea as Redis's RDB+AOF pairing or
+Postgres checkpoints) bound both. The design that would slot into this
+codebase:
+
+1. **Trigger**: after every K log records (or B bytes appended), a snapshot
+   runs — under the queue locks, or from a copy taken under the locks so the
+   pause is one memory copy, not one disk write.
+2. **Rotate first**: start appending to a fresh log file (`queue.log.2`).
+   From this instant, the old log is immutable and the snapshot has a clean
+   cut point.
+3. **Write the snapshot**: serialize all live messages (both heaps, plus each
+   queue's config and sequence counter) to `snapshot.tmp`, `fsync` it, then
+   atomically `rename()` to `snapshot.json`. The rename is the commit point —
+   readers can never observe a half-written snapshot.
+4. **Delete the old log** — only after the rename lands. Recovery is now:
+   load `snapshot.json`, then replay only the short `queue.log.2` tail.
+
+Crash safety falls out of the ordering: a crash before the rename leaves the
+old snapshot + both logs (full replay still works); a crash after the rename
+but before the delete leaves a stale log that recovery can identify and skip
+via the sequence counter stored in the snapshot. Every state on disk is
+recoverable; nothing depends on two files changing together.
+
+**Why it's documented rather than implemented:** it roughly doubles the
+persistence code and adds the subtlest failure windows in the system (the
+rotate/rename/delete ordering above), while at demo scale replay is
+milliseconds. The WAL was built to make acknowledged writes durable — the
+requirement; snapshots make *restarts fast and disk bounded* — an optimization
+with a clear design ready when the log gets long.
 
 ### Concurrency
 
